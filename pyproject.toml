@@ -1,0 +1,52 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "owl24-py"
+version = "0.1.1"
+description = "Custom owl24 OpenTelemetry wrapper with data masking"
+readme = "README.md"
+requires-python = ">=3.8"
+license = "MIT"
+authors = [
+    { name = "Madnands5" }
+]
+keywords = ["observability", "opentelemetry", "apm", "tracing", "logging", "monitoring", "owl24"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Monitoring",
+]
+dependencies = [
+    # Floor raised to 1.39 (not the original 1.27): that's the release where
+    # opentelemetry.sdk._logs.LogRecord was removed in favor of passing
+    # kwargs directly to Logger.emit(), which is what telemetry.py now does
+    # - older versions don't support that emit() signature.
+    "opentelemetry-api>=1.39.0,<2.0.0",
+    "opentelemetry-sdk>=1.39.0,<2.0.0",
+    "opentelemetry-exporter-otlp>=1.39.0,<2.0.0",
+    # Host metrics (CPU/memory/network) - the Python equivalent of
+    # owl24-js's @opentelemetry/host-metrics and owl24-java's
+    # runtime-telemetry-java8. A hard dependency (unlike the framework
+    # instrumentations below) since it's universal - no per-framework
+    # variance, so there's no reason to make it opt-in.
+    "opentelemetry-instrumentation-system-metrics>=0.65b0"
+]
+
+# Optional auto-tracing for common frameworks/libraries - not hard
+# dependencies, since forcing e.g. Flask onto a Django or plain-script user
+# would be dead weight. Each one is also try/except-guarded at import time
+# in telemetry.py, so init() still works fine with none of these installed
+# (falls back to logs-only + manual spans, same as today) - installing the
+# extra is what turns on automatic HTTP span creation for that library.
+[project.optional-dependencies]
+flask = ["opentelemetry-instrumentation-flask>=0.65b0"]
+django = ["opentelemetry-instrumentation-django>=0.65b0"]
+fastapi = ["opentelemetry-instrumentation-fastapi>=0.65b0"]
+requests = ["opentelemetry-instrumentation-requests>=0.65b0"]
+
+[project.urls]
+Homepage = "https://owl24.dev"
+Repository = "https://github.com/Madnands5/owl24"
