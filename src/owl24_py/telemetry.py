@@ -7,6 +7,9 @@ import signal
 import threading
 import time
 import traceback
+import urllib.request
+import urllib.error
+from importlib.metadata import version as _pkg_version, PackageNotFoundError
 from typing import Any
 from types import MappingProxyType
 
@@ -25,7 +28,7 @@ for _stream in (sys.stdout, sys.stderr):
 
 from opentelemetry import trace, metrics
 from opentelemetry.sdk.resources import Resource, SERVICE_NAME, SERVICE_VERSION
-from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace import TracerProvider, SpanProcessor
 from opentelemetry.sdk.trace.export import BatchSpanProcessor, SpanExporter
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
 from opentelemetry.sdk.metrics import MeterProvider
@@ -36,15 +39,22 @@ from opentelemetry.sdk._logs import LoggerProvider
 from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
 from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
 from opentelemetry.instrumentation.system_metrics import SystemMetricsInstrumentor
+# Hard dependency as of 0.1.2 (was an optional extra) - FastAPI is this
+# package's primary consumer, so it's always available, unlike the
+# best-effort ones below.
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 
-# Best-effort auto-tracing for whichever of these the host app already has
-# installed - mirrors owl24-js's getNodeAutoInstrumentations() "instrument
-# whatever's present" behavior, without making any of them a hard dependency
-# of this package (see the `[project.optional-dependencies]` extras in
-# pyproject.toml). Each import is independently guarded: a host app with
-# none of these installed still gets logs + manual spans + host metrics,
+# Auto-tracing for whichever of these the host app already has installed -
+# mirrors owl24-js's getNodeAutoInstrumentations() "instrument whatever's
+# present" behavior. Every one of these OTel instrumentor packages is now a
+# hard dependency of owl24-py itself (pyproject.toml) - the try/except here
+# is defensive only (a broken/partial install), not a gate on whether the
+# consumer remembered to opt into an extra. The actual framework/driver
+# library (Flask/Django/psycopg2/etc.) is still the host app's own
+# dependency, not owl24-py's - a host app that doesn't use a given one still
+# gets logs + manual spans + host metrics + every OTHER instrumentor,
 # exactly as before.
-_AUTO_INSTRUMENTORS = []
+_AUTO_INSTRUMENTORS = [("fastapi", FastAPIInstrumentor)]
 try:
     from opentelemetry.instrumentation.flask import FlaskInstrumentor
     _AUTO_INSTRUMENTORS.append(("flask", FlaskInstrumentor))
@@ -56,13 +66,35 @@ try:
 except ImportError:
     pass
 try:
-    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
-    _AUTO_INSTRUMENTORS.append(("fastapi", FastAPIInstrumentor))
+    from opentelemetry.instrumentation.requests import RequestsInstrumentor
+    _AUTO_INSTRUMENTORS.append(("requests", RequestsInstrumentor))
+except ImportError:
+    pass
+# DB drivers - each tags its spans with the `db.system`/`db.name` OTel
+# semantic-convention attributes that DbMetricsSpanProcessor below watches
+# for, exactly like the framework instrumentors above but for database
+# calls instead of HTTP. Same hard-dependency treatment as those: a host
+# app that doesn't use a given driver still gets everything else, just no
+# `db.query.*` metrics for that one (nothing ever produces a
+# `db.system`-tagged span to derive them from).
+try:
+    from opentelemetry.instrumentation.psycopg2 import Psycopg2Instrumentor
+    _AUTO_INSTRUMENTORS.append(("psycopg2", Psycopg2Instrumentor))
 except ImportError:
     pass
 try:
-    from opentelemetry.instrumentation.requests import RequestsInstrumentor
-    _AUTO_INSTRUMENTORS.append(("requests", RequestsInstrumentor))
+    from opentelemetry.instrumentation.pymongo import PymongoInstrumentor
+    _AUTO_INSTRUMENTORS.append(("pymongo", PymongoInstrumentor))
+except ImportError:
+    pass
+try:
+    from opentelemetry.instrumentation.pymysql import PyMySQLInstrumentor
+    _AUTO_INSTRUMENTORS.append(("pymysql", PyMySQLInstrumentor))
+except ImportError:
+    pass
+try:
+    from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
+    _AUTO_INSTRUMENTORS.append(("sqlalchemy", SQLAlchemyInstrumentor))
 except ImportError:
     pass
 
@@ -169,6 +201,73 @@ class MaskingSpanExporter(SpanExporter):
     def force_flush(self, timeout_millis=30000):
         force_flush_fn = getattr(self._wrapped, "force_flush", None)
         return force_flush_fn(timeout_millis) if force_flush_fn else True
+
+
+class DbMetricsSpanProcessor(SpanProcessor):
+    """Derives DB query metrics (count, duration, errors) from spans that
+    the driver instrumentors above already tag with `db.system` (psycopg2,
+    pymongo, pymysql, sqlalchemy, etc.) - no separate per-driver hooking
+    needed, and it's the same shape as owl24-js's DbMetricsSpanProcessor
+    since these are OTel semantic conventions, not something owl24-py
+    invented. Instruments are created lazily on first matching span (not in
+    __init__) since the global MeterProvider isn't set until later in
+    init() - this processor is registered on the tracer provider before
+    that happens, but no real span ends before init() itself returns.
+    Feeds the same metric_readers as SystemMetricsInstrumentor above, so
+    these ride the existing OTLP metrics export pipeline into the same
+    `metrics` table dashboard-api.js already reads CPU/memory from - no
+    separate ingestion path needed.
+    """
+
+    def __init__(self):
+        self._query_count = None
+        self._query_duration = None
+        self._query_errors = None
+
+    def _ensure_instruments(self):
+        if self._query_count is not None:
+            return
+        meter = metrics.get_meter("owl24-db-metrics")
+        self._query_count = meter.create_counter(
+            "db.query.count",
+            description="Number of database queries observed via auto-instrumented spans",
+        )
+        self._query_duration = meter.create_histogram(
+            "db.query.duration_ms",
+            description="Database query duration in milliseconds",
+            unit="ms",
+        )
+        self._query_errors = meter.create_counter(
+            "db.query.error_count",
+            description="Number of database queries that ended in an error",
+        )
+
+    def on_start(self, span, parent_context=None):
+        pass
+
+    def on_end(self, span):
+        attrs = span.attributes or {}
+        db_system = attrs.get("db.system")
+        if not db_system:
+            return
+
+        self._ensure_instruments()
+        attributes = {"db.system": db_system}
+        db_name = attrs.get("db.name")
+        if db_name:
+            attributes["db.name"] = db_name
+
+        duration_ms = (span.end_time - span.start_time) / 1e6
+        self._query_count.add(1, attributes)
+        self._query_duration.record(duration_ms, attributes)
+        if span.status is not None and span.status.status_code == trace.StatusCode.ERROR:
+            self._query_errors.add(1, attributes)
+
+    def shutdown(self):
+        pass
+
+    def force_flush(self, timeout_millis=30000):
+        return True
 
 
 class _StatusTracker:
@@ -355,6 +454,46 @@ class MaskingAndOtelHandler(logging.Handler):
         except Exception as e:
             print(f"[Owl24] Bridge Error: {e}", file=sys.stderr)
 
+
+def _installed_version() -> str:
+    try:
+        return _pkg_version("owl24-py")
+    except PackageNotFoundError:
+        # Editable/dev install without proper package metadata registered -
+        # not a real version to report, but init() must never crash over
+        # this, so fall back to something clearly not a real release.
+        return "0.0.0"
+
+
+# Called once, synchronously, at the very start of init() - separate from
+# the OTLP exporters below because they never expose their underlying HTTP
+# response back to caller code (SpanExporter.export() just returns a
+# SUCCESS/FAILURE enum), so there's no way to detect ingestor.js's 426
+# Upgrade Required from inside a normal export call. A short timeout and a
+# blanket try/except mean a slow/unreachable server here degrades to
+# "assume fine, proceed" rather than delaying or breaking the host app's
+# own startup - the same non-blocking-failure philosophy as the rest of
+# init().
+def _check_sdk_version(ingest_base_url, headers, timeout_seconds):
+    try:
+        request = urllib.request.Request(
+            f"{ingest_base_url}/v1/sdk-check",
+            method="POST",
+            headers=headers,
+        )
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            body = json.loads(response.read().decode("utf-8"))
+        if body.get("update_required"):
+            print("[Owl24] Please Update package. telemetry shutting down", file=sys.stderr)
+            return True
+        return False
+    except Exception:
+        # Unreachable/unexpected response: fail open (assume the version is
+        # fine) rather than blocking a customer's app startup on an ingest
+        # endpoint being temporarily unavailable.
+        return False
+
+
 class Owl24:
     _tracer_provider = None
     _meter_provider = None
@@ -424,7 +563,7 @@ class Owl24:
     @classmethod
     def init(cls, api_key=None, service_name="dice-server", export_interval_millis=3000,
              disable_console_bridge=False, disable_crash_capture=False, export_timeout_millis=5000,
-             disable_auto_instrumentation=False):
+             disable_auto_instrumentation=False, metrics_export_interval_millis=30000):
         resolved_api_key = api_key or os.getenv("owl24_API_KEY") or os.getenv("OBSERVE_API_KEY")
         user_email = os.getenv("owl24_USER_EMAIL") or os.getenv("OBSERVE_USER_EMAIL") or "unknown@local.dev"
         # Hardcoded, not configurable: owl24 is a fully-hosted service with
@@ -442,7 +581,13 @@ class Owl24:
         # SDK failing to initialize should degrade to a no-op, not take the
         # customer's app down with it.
         try:
-            headers = {"x-api-key": resolved_api_key, "x-user-email": user_email}
+            sdk_version = _installed_version()
+            headers = {
+                "x-api-key": resolved_api_key,
+                "x-user-email": user_email,
+                "x-sdk-language": "python",
+                "x-sdk-version": sdk_version,
+            }
             resource = Resource.create({
                 SERVICE_NAME: service_name,
                 SERVICE_VERSION: "0.1.0",
@@ -459,6 +604,15 @@ class Owl24:
             # unreachable endpoint hung past 12s despite a 5s force_flush
             # timeout.
             export_timeout_seconds = export_timeout_millis / 1000
+
+            # Server-side version gate (ingestor.js) refuses actual
+            # telemetry ingestion from a version this far behind anyway -
+            # checking here first means a customer running a known-bad old
+            # release (like the pre-0.1.4 metrics blowup) finds out via a
+            # clear log line at startup, instead of every export silently
+            # failing with no explanation.
+            if _check_sdk_version(ingest_base_url, headers, export_timeout_seconds):
+                return
 
             # Tracks whether each of traces/metrics/logs is actually getting
             # through (not just whether it was built without error) - logs
@@ -477,20 +631,48 @@ class Owl24:
             cls._tracer_provider.add_span_processor(
                 BatchSpanProcessor(status_tracked_trace_exporter, schedule_delay_millis=export_interval_millis)
             )
+            cls._tracer_provider.add_span_processor(DbMetricsSpanProcessor())
             trace.set_tracer_provider(cls._tracer_provider)
 
+            # Deliberately NOT export_interval_millis (traces/logs' 3s
+            # default) - host/DB metrics are slow-changing aggregates, not
+            # per-event data, so flushing them every 3s was pure overhead.
+            # Confirmed live: SystemMetricsInstrumentor's default config below
+            # (unset = every metric it knows, several exploded per-core/
+            # per-disk/per-interface) at a 3s interval produced 4.3M metric
+            # rows/day from ONE service - 99% of total DB size. A 30s default
+            # cuts that ~10x on its own, on top of the config restriction.
             metric_exporter = OTLPMetricExporter(endpoint=f"{ingest_base_url}/v1/metrics", headers=headers, timeout=export_timeout_seconds)
             status_tracked_metric_exporter = _StatusTrackingExporter(metric_exporter, "metrics", cls._status_tracker)
-            reader = PeriodicExportingMetricReader(status_tracked_metric_exporter, export_interval_millis=export_interval_millis)
+            reader = PeriodicExportingMetricReader(status_tracked_metric_exporter, export_interval_millis=metrics_export_interval_millis)
             cls._meter_provider = MeterProvider(resource=resource, metric_readers=[reader])
             metrics.set_meter_provider(cls._meter_provider)
 
             # Host metrics (CPU/memory/network) - the Python equivalent of
             # owl24-js's HostMetrics and owl24-java's runtime-telemetry-java8
-            # observers. Unlike those, this was previously entirely missing:
-            # a MeterProvider was wired up but nothing ever created a metric
-            # instrument, so no metrics data was ever actually produced.
-            cls._system_metrics_instrumentor = SystemMetricsInstrumentor()
+            # observers. Explicit config (not SystemMetricsInstrumentor's
+            # default) - the default's _DEFAULT_CONFIG covers ~30 metric
+            # names, many broken down per CPU core/disk/network interface,
+            # which is what produced the runaway volume above. This is a
+            # deliberately small, still-useful subset: overall CPU/memory
+            # utilization (not per-core/per-state-and-core breakdowns), this
+            # process's own CPU/memory, plus GC/thread/swap health (added for
+            # parity with owl24-java's runtime-telemetry, which already
+            # reports GC and thread count) - none of these five explode
+            # per-core/per-disk/per-interface the way system.disk.*/
+            # system.network.* do, so they stay cheap even though the count
+            # of metric names grew.
+            cls._system_metrics_instrumentor = SystemMetricsInstrumentor(config={
+                "system.cpu.utilization": ["idle", "user", "system"],
+                "system.memory.utilization": ["used", "free"],
+                "system.swap.utilization": ["used", "free"],
+                "process.runtime.cpu.utilization": None,
+                "process.runtime.memory": ["rss"],
+                "process.runtime.thread_count": None,
+                "process.runtime.gc_count": None,
+                "cpython.gc.collected_objects": None,
+                "cpython.gc.uncollectable_objects": None,
+            })
             cls._system_metrics_instrumentor.instrument()
 
             if not disable_auto_instrumentation:

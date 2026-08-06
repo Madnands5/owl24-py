@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "owl24-py"
-version = "0.1.1"
+version = "0.1.4"
 description = "Custom owl24 OpenTelemetry wrapper with data masking"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -32,20 +32,40 @@ dependencies = [
     # runtime-telemetry-java8. A hard dependency (unlike the framework
     # instrumentations below) since it's universal - no per-framework
     # variance, so there's no reason to make it opt-in.
-    "opentelemetry-instrumentation-system-metrics>=0.65b0"
+    "opentelemetry-instrumentation-system-metrics>=0.65b0",
+    # Promoted from an optional extra in 0.1.1: a consumer that installed
+    # plain `owl24-py` (no `[fastapi]` extra) got a fully-wired but
+    # permanently empty trace pipeline - FastAPIInstrumentor's import
+    # silently failed, no spans were ever created, and the exporter's
+    # "traces" status stayed PENDING forever with no working/not-working
+    # signal either way. FastAPI is this package's primary/most common
+    # consumer, so it's now installed unconditionally instead of relying on
+    # every consumer's requirements.txt remembering the extra.
+    "opentelemetry-instrumentation-fastapi>=0.65b0",
+    # Everything below was previously gated behind `[project.optional-
+    # dependencies]` extras (owl24-py[flask]/[django]/[psycopg2]/etc.) -
+    # promoted to hard dependencies for the same reason FastAPI was above,
+    # generalized: a consumer shouldn't have to know or remember which extra
+    # unlocks tracing for a framework/driver they already use, and every
+    # owl24 SDK except this one already behaves this way (owl24-js's
+    # getNodeAutoInstrumentations() bundles all of its instrumentations
+    # unconditionally, no extras at all). None of these packages are the
+    # actual framework/driver library itself (Flask/Django/psycopg2/pymongo/
+    # pymysql/SQLAlchemy remain the consumer's own dependency, same as a
+    # plain `requests` import always has been) - they're lightweight OTel
+    # wrapt-based patchers that only activate if the real library the
+    # consumer's own app already depends on happens to be installed; each
+    # one stays try/except-guarded in telemetry.py (defensive only now, not
+    # gating availability), so init() degrades gracefully regardless of
+    # which frameworks/drivers a given consumer's app actually uses.
+    "opentelemetry-instrumentation-flask>=0.65b0",
+    "opentelemetry-instrumentation-django>=0.65b0",
+    "opentelemetry-instrumentation-requests>=0.65b0",
+    "opentelemetry-instrumentation-psycopg2>=0.65b0",
+    "opentelemetry-instrumentation-pymongo>=0.65b0",
+    "opentelemetry-instrumentation-pymysql>=0.65b0",
+    "opentelemetry-instrumentation-sqlalchemy>=0.65b0"
 ]
-
-# Optional auto-tracing for common frameworks/libraries - not hard
-# dependencies, since forcing e.g. Flask onto a Django or plain-script user
-# would be dead weight. Each one is also try/except-guarded at import time
-# in telemetry.py, so init() still works fine with none of these installed
-# (falls back to logs-only + manual spans, same as today) - installing the
-# extra is what turns on automatic HTTP span creation for that library.
-[project.optional-dependencies]
-flask = ["opentelemetry-instrumentation-flask>=0.65b0"]
-django = ["opentelemetry-instrumentation-django>=0.65b0"]
-fastapi = ["opentelemetry-instrumentation-fastapi>=0.65b0"]
-requests = ["opentelemetry-instrumentation-requests>=0.65b0"]
 
 [project.urls]
 Homepage = "https://owl24.dev"

@@ -29,7 +29,7 @@ Owl24.init(
     disable_console_bridge=False,     # set True to stop auto-forwarding logging.* calls
     disable_crash_capture=False,      # set True to disable uncaught-exception capture
     export_timeout_millis=5000,
-    disable_auto_instrumentation=False, # set True to skip Flask/Django/FastAPI/requests auto-tracing
+    disable_auto_instrumentation=False, # set True to skip Flask/Django/FastAPI/requests/DB auto-tracing
 )
 ```
 
@@ -39,22 +39,14 @@ Telemetry is always sent to `https://ingest.owl24.dev` — owl24's ingest endpoi
 
 - **Logs**: patches the root `logging` logger — every `logging.*` call is forwarded as a structured log, tagged with the active trace/span ID if one exists.
 - **Traces**: sets up an OpenTelemetry `TracerProvider` exporting via OTLP/HTTP. Spans you create manually, or automatically via Flask/Django/FastAPI/`requests` (see below), are masked and exported.
+- **Database metrics**: queries via psycopg2/pymongo/pymysql/SQLAlchemy (see [Database metrics](#database-metrics)) are automatically turned into `db.query.count`/`db.query.duration_ms`/`db.query.error_count` on your dashboard's Database page.
 - **Host metrics**: CPU, memory, and network metrics are collected and exported automatically via `opentelemetry-instrumentation-system-metrics` — no setup required.
 - **Crash capture**: installs a `sys.excepthook` and `threading.excepthook` so uncaught exceptions (main thread and background threads) are captured as FATAL-severity log events and flushed before the process exits.
 - **PII masking**: emails, credit-card-shaped numbers, phone numbers, and bearer tokens are scrubbed from span attributes and log bodies before they ever leave your process.
 
 ## Automatic HTTP tracing
 
-Install the extra for whichever framework/library you use, and `Owl24.init()` will automatically create spans for incoming requests (Flask/Django/FastAPI) or outgoing calls (`requests`) — no other code changes needed:
-
-```bash
-pip install "owl24-py[flask]"      # Flask
-pip install "owl24-py[django]"     # Django
-pip install "owl24-py[fastapi]"    # FastAPI
-pip install "owl24-py[requests]"   # outgoing requests via the `requests` library
-```
-
-None of these are installed by default — `pip install owl24-py` alone still gives you logs, host metrics, crash capture, and manually-created spans, with zero extra framework dependencies pulled in.
+`pip install owl24-py` is self-sufficient — no extras, no separate install step for any framework. If your app already uses Flask, Django, FastAPI, or `requests`, `Owl24.init()` automatically creates spans for incoming requests (Flask/Django/FastAPI) or outgoing calls (`requests`) the moment you call it, since the OTel instrumentor for each is already installed unconditionally. (The frameworks themselves — Flask, Django, etc. — are still your app's own dependency, same as always; owl24-py just ships the wiring that activates automatically once one is present.)
 
 ### Flask and FastAPI: call `Owl24.init()` before importing the framework
 
@@ -71,6 +63,10 @@ app = Flask(__name__)
 Getting this backwards doesn't raise an error or a warning - it just silently produces zero traces, ever, for that service. Why: Flask/FastAPI's instrumentation works by reassigning the framework's own `Flask`/`FastAPI` class in its module (e.g. `flask.Flask = _InstrumentedFlask`) - if your code already did `from flask import Flask` and bound that name to the original class before `Owl24.init()` runs, that name keeps pointing at the unpatched original forever; reassigning `flask.Flask` afterward can't reach back and fix an already-bound reference. (Using `import flask` and calling `flask.Flask(...)` instead of `from flask import Flask` sidesteps this entirely, since that always resolves the class fresh - but `Owl24.init()` first is the simpler rule to just always follow.)
 
 **Django doesn't have this restriction** - its instrumentation works by inserting into Django's `settings.MIDDLEWARE`, which Django resolves lazily when it actually starts handling requests, not by reassigning a class. Import order doesn't matter for Django.
+
+## Database metrics
+
+Same story as the HTTP frameworks above — no extra install step. If your app already talks to a database via psycopg2 (PostgreSQL), pymongo (MongoDB), PyMySQL, or SQLAlchemy (any dialect it supports), every query is automatically traced and reported to your dashboard's Database page as `db.query.count`, `db.query.duration_ms`, and `db.query.error_count`, grouped by DB system, from the moment you call `Owl24.init()`.
 
 ## License
 
