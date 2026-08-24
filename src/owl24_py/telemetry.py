@@ -110,21 +110,29 @@ _PYTHON_TO_OTEL_SEVERITY = {
 }
 
 
-MASK_PATTERNS = {
-    "email": re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}"),
-    "creditCard": re.compile(r"\b(?:\d[ -]*?){13,16}\b"),
-    "phone": re.compile(r"(\+?\d{1,3}[-.\s]?)?\(?\d{3}\)?[-.\s]?\d{3}[-.\s]?\d{4}"),
-    "bearerToken": re.compile(r"Bearer\s+[A-Za-z0-9-_=]+\.[A-Za-z0-9-_=]+\.?[A-Za-z0-9-_.+/=]*")
-}
+# Task 8 (todolist.md), expanded 2026-08-23 - see masking.py for the full
+# detection categories (PCI-DSS cards with Luhn validation, gitleaks-derived
+# secret prefixes, IBAN/MOD-97, US routing numbers, IP truncation, RFC1918
+# detection, internal hostname suffixes) and the customer-configurable
+# field-name mechanism (is_sensitive_field_name/configure_masking) that
+# backs proprietary/business-sensitive data, which has no pattern of its own.
+from .masking import mask_sensitive_data, is_sensitive_field_name, configure_masking
 
-def mask_sensitive_data(text: str) -> str:
-    if not isinstance(text, str):
-        return text
-    text = MASK_PATTERNS["email"].sub("[EMAIL_MASKED]", text)
-    text = MASK_PATTERNS["creditCard"].sub("[CARD_MASKED]", text)
-    text = MASK_PATTERNS["phone"].sub("[PHONE_MASKED]", text)
-    text = MASK_PATTERNS["bearerToken"].sub("[TOKEN_MASKED]", text)
-    return text
+# Task H (competitive-roadmap.md) - same field-name/value-pattern masking
+# rule as MaskingSpanExporter below, reused by track_event() for event
+# attributes: customers will inevitably put arbitrary key-value data in
+# events, same risk profile as span/log attributes.
+def _mask_attributes(attributes):
+    masked = {}
+    for key, value in (attributes or {}).items():
+        if is_sensitive_field_name(key):
+            masked[key] = "[FIELD_MASKED]"
+        elif isinstance(value, str):
+            masked[key] = mask_sensitive_data(value)
+        else:
+            masked[key] = value
+    return masked
+
 
 def safe_serialize(obj: Any) -> str:
     try:
@@ -186,7 +194,11 @@ class MaskingSpanExporter(SpanExporter):
             try:
                 original_attrs = dict(span.attributes or {})
                 masked_attrs = {
-                    key: (mask_sensitive_data(value) if isinstance(value, str) else value)
+                    key: (
+                        "[FIELD_MASKED]" if is_sensitive_field_name(key)
+                        else mask_sensitive_data(value) if isinstance(value, str)
+                        else value
+                    )
                     for key, value in original_attrs.items()
                 }
                 masked_spans.append(_MaskedReadableSpan(span, MappingProxyType(masked_attrs)))
@@ -504,6 +516,7 @@ class Owl24:
     _system_metrics_instrumentor = None
     _active_auto_instrumentors = []
     _status_tracker = None
+    _event_ingest_config = None
 
     @classmethod
     def _record_fatal(cls, origin, exc_type, exc_value, exc_tb):
@@ -563,7 +576,17 @@ class Owl24:
     @classmethod
     def init(cls, api_key=None, service_name="dice-server", export_interval_millis=3000,
              disable_console_bridge=False, disable_crash_capture=False, export_timeout_millis=5000,
-             disable_auto_instrumentation=False, metrics_export_interval_millis=30000):
+             disable_auto_instrumentation=False, metrics_export_interval_millis=30000,
+             mask_fields=None, internal_hostname_suffixes=None):
+        """
+        mask_fields: field names (attribute/log keys) to mask wholesale on
+            top of the built-in default list - exact names or '*'-wildcard
+            patterns, e.g. ['*api_key*', 'pricing.*', 'internal_customer_id'].
+            Additive, not a replacement (Task 8, todolist.md).
+        internal_hostname_suffixes: additional hostname suffixes to mask
+            (default: .internal, .svc.cluster.local, .corp), also additive.
+        """
+        configure_masking(mask_fields, internal_hostname_suffixes)
         resolved_api_key = api_key or os.getenv("owl24_API_KEY") or os.getenv("OBSERVE_API_KEY")
         user_email = os.getenv("owl24_USER_EMAIL") or os.getenv("OBSERVE_USER_EMAIL") or "unknown@local.dev"
         # Hardcoded, not configurable: owl24 is a fully-hosted service with
@@ -613,6 +636,15 @@ class Owl24:
             # failing with no explanation.
             if _check_sdk_version(ingest_base_url, headers, export_timeout_seconds):
                 return
+
+            # Task H (competitive-roadmap.md) - track_event() reads this
+            # once init() has resolved the same headers/service_name every
+            # other exporter above already uses.
+            cls._event_ingest_config = {
+                "ingest_base_url": ingest_base_url,
+                "headers": headers,
+                "service_name": service_name,
+            }
 
             # Tracks whether each of traces/metrics/logs is actually getting
             # through (not just whether it was built without error) - logs
@@ -726,6 +758,44 @@ class Owl24:
             except Exception as e:
                 print(f"[Owl24] Failed to uninstrument {instrumentor}: {e}", file=sys.stderr)
         cls._active_auto_instrumentors = []
+
+    @classmethod
+    def track_event(cls, name, attributes=None):
+        """Task H (competitive-roadmap.md) - marks a discrete event (a
+        deploy, a feature-flag flip, a customer-defined business event) so
+        it shows up as a marker on the dashboard's time-series charts.
+        Fire-and-forget via a background daemon thread (matching owl24-js's
+        non-awaited fetch) so a slow/unreachable ingest endpoint never
+        blocks the caller's own request path. `attributes` is masked the
+        same way span/log attributes are before it ever leaves this process.
+        """
+        if not cls._event_ingest_config:
+            print("[Owl24] track_event() called before init().", file=sys.stderr)
+            return
+        if not name or not isinstance(name, str):
+            print("[Owl24] track_event() requires a non-empty name.", file=sys.stderr)
+            return
+
+        config = cls._event_ingest_config
+        body = json.dumps({
+            "name": name,
+            "serviceName": config["service_name"],
+            "attributes": _mask_attributes(attributes),
+        }).encode("utf-8")
+
+        def _send():
+            try:
+                request = urllib.request.Request(
+                    f"{config['ingest_base_url']}/v1/events",
+                    data=body,
+                    method="POST",
+                    headers={**config["headers"], "Content-Type": "application/json"},
+                )
+                urllib.request.urlopen(request, timeout=5)
+            except Exception as e:
+                print(f"[Owl24] track_event() failed: {e}", file=sys.stderr)
+
+        threading.Thread(target=_send, daemon=True).start()
 
 def handle_sigterm(signum, frame):
     Owl24.shutdown()

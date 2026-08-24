@@ -67,6 +67,13 @@ dependencies = [
     "opentelemetry-instrumentation-sqlalchemy>=0.65b0"
 ]
 
+[project.optional-dependencies]
+# Task 12 (todolist.md, added 2026-08-23) - pytest wasn't a dependency
+# anywhere in this file before. An optional extra (`pip install
+# owl24-py[test]`), not a hard dependency, since a real consumer installing
+# this SDK into their own app has no reason to also pull in a test runner.
+test = ["pytest>=8.0.0", "pytest-cov>=5.0.0"]
+
 [project.urls]
 Homepage = "https://owl24.dev"
 Repository = "https://github.com/Madnands5/owl24"
