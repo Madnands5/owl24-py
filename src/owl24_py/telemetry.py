@@ -3,6 +3,7 @@ import re
 import sys
 import json
 import logging
+import random
 import signal
 import threading
 import time
@@ -34,6 +35,7 @@ from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExport
 from opentelemetry.sdk.metrics import MeterProvider
 from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
 from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
+from opentelemetry.exporter.otlp.proto.http import Compression
 from opentelemetry._logs import SeverityNumber, set_logger_provider
 from opentelemetry.sdk._logs import LoggerProvider
 from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
@@ -574,10 +576,10 @@ class Owl24:
             threading.excepthook = threading_excepthook
 
     @classmethod
-    def init(cls, api_key=None, service_name="dice-server", export_interval_millis=3000,
+    def init(cls, api_key=None, service_name="dice-server", export_interval_millis=10000,
              disable_console_bridge=False, disable_crash_capture=False, export_timeout_millis=5000,
              disable_auto_instrumentation=False, metrics_export_interval_millis=30000,
-             mask_fields=None, internal_hostname_suffixes=None):
+             mask_fields=None, internal_hostname_suffixes=None, ingest_base_url=None):
         """
         mask_fields: field names (attribute/log keys) to mask wholesale on
             top of the built-in default list - exact names or '*'-wildcard
@@ -585,15 +587,18 @@ class Owl24:
             Additive, not a replacement (Task 8, todolist.md).
         internal_hostname_suffixes: additional hostname suffixes to mask
             (default: .internal, .svc.cluster.local, .corp), also additive.
+        ingest_base_url: overrides the ingest endpoint (default:
+            https://ingest.owl24.dev) - for self-hosted customers pointing
+            this SDK at their own collector instead of owl24's hosted
+            endpoint.
         """
         configure_masking(mask_fields, internal_hostname_suffixes)
         resolved_api_key = api_key or os.getenv("owl24_API_KEY") or os.getenv("OBSERVE_API_KEY")
         user_email = os.getenv("owl24_USER_EMAIL") or os.getenv("OBSERVE_USER_EMAIL") or "unknown@local.dev"
-        # Hardcoded, not configurable: owl24 is a fully-hosted service with
-        # one fixed ingest endpoint - unlike the API key (which is
-        # per-customer) or user email, there's nothing for a caller to
-        # legitimately point this at instead.
-        ingest_base_url = "https://ingest.owl24.dev"
+        # Defaults to owl24's hosted ingest endpoint, same as
+        # owl24-web's ingestBaseUrl option - overridable via ingest_base_url
+        # for self-hosted customers running their own collector.
+        ingest_base_url = ingest_base_url or "https://ingest.owl24.dev"
 
         if not resolved_api_key:
             print("[Owl24] API Key required.", file=sys.stderr)
@@ -656,12 +661,18 @@ class Owl24:
             cls._status_tracker = _StatusTracker()
 
             cls._tracer_provider = TracerProvider(resource=resource)
-            trace_exporter = OTLPSpanExporter(endpoint=f"{ingest_base_url}/v1/traces", headers=headers, timeout=export_timeout_seconds)
+            trace_exporter = OTLPSpanExporter(
+                endpoint=f"{ingest_base_url}/v1/traces", headers=headers,
+                timeout=export_timeout_seconds, compression=Compression.Gzip,
+            )
             status_tracked_trace_exporter = _StatusTrackingExporter(
                 MaskingSpanExporter(trace_exporter), "traces", cls._status_tracker
             )
             cls._tracer_provider.add_span_processor(
-                BatchSpanProcessor(status_tracked_trace_exporter, schedule_delay_millis=export_interval_millis)
+                BatchSpanProcessor(
+                    status_tracked_trace_exporter, schedule_delay_millis=export_interval_millis,
+                    max_export_batch_size=2048, max_queue_size=8192,
+                )
             )
             cls._tracer_provider.add_span_processor(DbMetricsSpanProcessor())
             trace.set_tracer_provider(cls._tracer_provider)
@@ -674,7 +685,10 @@ class Owl24:
             # per-disk/per-interface) at a 3s interval produced 4.3M metric
             # rows/day from ONE service - 99% of total DB size. A 30s default
             # cuts that ~10x on its own, on top of the config restriction.
-            metric_exporter = OTLPMetricExporter(endpoint=f"{ingest_base_url}/v1/metrics", headers=headers, timeout=export_timeout_seconds)
+            metric_exporter = OTLPMetricExporter(
+                endpoint=f"{ingest_base_url}/v1/metrics", headers=headers,
+                timeout=export_timeout_seconds, compression=Compression.Gzip,
+            )
             status_tracked_metric_exporter = _StatusTrackingExporter(metric_exporter, "metrics", cls._status_tracker)
             reader = PeriodicExportingMetricReader(status_tracked_metric_exporter, export_interval_millis=metrics_export_interval_millis)
             cls._meter_provider = MeterProvider(resource=resource, metric_readers=[reader])
@@ -717,12 +731,44 @@ class Owl24:
                         print(f"[Owl24] Auto-instrumentation for '{name}' failed: {auto_instrument_error}", file=sys.stderr)
 
             cls._logger_provider = LoggerProvider(resource=resource)
-            log_exporter = OTLPLogExporter(endpoint=f"{ingest_base_url}/v1/logs", headers=headers, timeout=export_timeout_seconds)
+            log_exporter = OTLPLogExporter(
+                endpoint=f"{ingest_base_url}/v1/logs", headers=headers,
+                timeout=export_timeout_seconds, compression=Compression.Gzip,
+            )
             status_tracked_log_exporter = _StatusTrackingExporter(log_exporter, "logs", cls._status_tracker)
             cls._logger_provider.add_log_record_processor(
-                BatchLogRecordProcessor(status_tracked_log_exporter, schedule_delay_millis=export_interval_millis)
+                BatchLogRecordProcessor(
+                    status_tracked_log_exporter, schedule_delay_millis=export_interval_millis,
+                    max_export_batch_size=2048, max_queue_size=8192,
+                )
             )
             set_logger_provider(cls._logger_provider)
+
+            # Startup jitter (best-effort): if a whole fleet of instances
+            # starts at the same moment (a rollout, a scale-up), they'd
+            # otherwise all schedule their first batch flush
+            # export_interval_millis later in lockstep, producing a
+            # synchronized request spike at the ingestor instead of smoothed
+            # traffic. This must NOT delay init() itself (spans have to be
+            # captured from t=0, and a blocking sleep here would regress k8s
+            # readiness probes) - so it's a one-shot daemon Timer, scheduled
+            # after both providers are already built/registered above, that
+            # fires once at a random point within one export interval and
+            # force-flushes whatever's queued so far. daemon=True means a
+            # still-pending timer can never block process exit; any failure
+            # is logged, not raised, since this is a traffic-smoothing nicety
+            # and must never be the reason telemetry (or the host app) breaks.
+            def _startup_jitter_flush():
+                try:
+                    cls._tracer_provider.force_flush()
+                    cls._logger_provider.force_flush()
+                except Exception as e:
+                    print(f"[Owl24] Startup jitter flush failed: {e}", file=sys.stderr)
+
+            jitter_seconds = random.uniform(0, export_interval_millis / 1000)
+            jitter_timer = threading.Timer(jitter_seconds, _startup_jitter_flush)
+            jitter_timer.daemon = True
+            jitter_timer.start()
 
             if not disable_console_bridge:
                 otel_logger = cls._logger_provider.get_logger("console-bridge")
