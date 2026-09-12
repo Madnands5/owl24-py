@@ -41,10 +41,6 @@ from opentelemetry.sdk._logs import LoggerProvider
 from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
 from opentelemetry.exporter.otlp.proto.http._log_exporter import OTLPLogExporter
 from opentelemetry.instrumentation.system_metrics import SystemMetricsInstrumentor
-# Hard dependency as of 0.1.2 (was an optional extra) - FastAPI is this
-# package's primary consumer, so it's always available, unlike the
-# best-effort ones below.
-from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 
 # Auto-tracing for whichever of these the host app already has installed -
 # mirrors owl24-js's getNodeAutoInstrumentations() "instrument whatever's
@@ -56,7 +52,27 @@ from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
 # dependency, not owl24-py's - a host app that doesn't use a given one still
 # gets logs + manual spans + host metrics + every OTHER instrumentor,
 # exactly as before.
-_AUTO_INSTRUMENTORS = [("fastapi", FastAPIInstrumentor)]
+#
+# FastAPI is NOT special-cased/unconditional here despite 0.1.2-0.1.6 saying
+# otherwise (a real bug, found via a live soak test against every clientserver
+# demo, 2026-09-12): opentelemetry-instrumentation-fastapi's own __init__.py
+# does its own unconditional `import fastapi` at module load - a Flask/Django
+# consumer that has never installed the real fastapi package (most of them
+# haven't; it's not one of THEIR framework's own dependencies) got a hard
+# ModuleNotFoundError crash at import time, every time, not a graceful
+# degradation - worse than the original 0.1.1 bug this was meant to fix
+# (silently-empty traces), since it took the whole process down instead.
+# try/except here fixes both at once: a FastAPI consumer's own app always has
+# real fastapi installed (it's what makes their app a FastAPI app), so this
+# import succeeds for them with zero extra config, same as before - a
+# Flask/Django/plain consumer's app doesn't, so it's skipped gracefully
+# instead of crashing, exactly like every other instrumentor below.
+_AUTO_INSTRUMENTORS = []
+try:
+    from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+    _AUTO_INSTRUMENTORS.append(("fastapi", FastAPIInstrumentor))
+except ImportError:
+    pass
 try:
     from opentelemetry.instrumentation.flask import FlaskInstrumentor
     _AUTO_INSTRUMENTORS.append(("flask", FlaskInstrumentor))

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "owl24-py"
-version = "0.1.6"
+version = "0.1.7"
 description = "Custom owl24 OpenTelemetry wrapper with data masking"
 readme = "README.md"
 requires-python = ">=3.8"
@@ -38,9 +38,13 @@ dependencies = [
     # permanently empty trace pipeline - FastAPIInstrumentor's import
     # silently failed, no spans were ever created, and the exporter's
     # "traces" status stayed PENDING forever with no working/not-working
-    # signal either way. FastAPI is this package's primary/most common
-    # consumer, so it's now installed unconditionally instead of relying on
-    # every consumer's requirements.txt remembering the extra.
+    # signal either way. Installing this instrumentor package unconditionally
+    # fixes that for FastAPI consumers with zero extra config - but does NOT
+    # mean `FastAPIInstrumentor` is safe to import unconditionally in
+    # telemetry.py (a real 0.1.2-0.1.6 bug: its own __init__.py does its own
+    # unconditional `import fastapi`, which crashes any Flask/Django consumer
+    # that never installed the real fastapi package - see telemetry.py's
+    # try/except around this one now, same as every other instrumentor below).
     "opentelemetry-instrumentation-fastapi>=0.65b0",
     # Everything below was previously gated behind `[project.optional-
     # dependencies]` extras (owl24-py[flask]/[django]/[psycopg2]/etc.) -
