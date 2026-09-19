@@ -80,4 +80,4 @@ test = ["pytest>=8.0.0", "pytest-cov>=5.0.0"]
 
 [project.urls]
 Homepage = "https://owl24.dev"
-Repository = "https://github.com/Madnands5/owl24"
+Repository = "https://github.com/Madnands5/owl24-py"

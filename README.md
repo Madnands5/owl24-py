@@ -68,6 +68,10 @@ Getting this backwards doesn't raise an error or a warning - it just silently pr
 
 Same story as the HTTP frameworks above — no extra install step. If your app already talks to a database via psycopg2 (PostgreSQL), pymongo (MongoDB), PyMySQL, or SQLAlchemy (any dialect it supports), every query is automatically traced and reported to your dashboard's Database page as `db.query.count`, `db.query.duration_ms`, and `db.query.error_count`, grouped by DB system, from the moment you call `Owl24.init()`.
 
+## Working with your coding agent
+
+Errors ingested via this SDK can be deduplicated and handed straight to your own coding agent - claim, investigate, fix, PR. Reach that queue interactively from Claude Code or Cursor with [owl24-mcp](https://github.com/Madnands5/owl24-mcp), or unattended via REST + AGENTS.md (see the [docs](https://owl24.dev/docs#agent-integration)).
+
 ## License
 
-MIT — see [LICENSE](https://github.com/Madnands5/owl24/blob/main/packages/owl24-py/LICENSE).
+MIT — see [LICENSE](https://github.com/Madnands5/owl24-py/blob/main/LICENSE).
