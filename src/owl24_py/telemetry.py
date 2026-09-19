@@ -277,13 +277,22 @@ class DbMetricsSpanProcessor(SpanProcessor):
 
     def on_end(self, span):
         attrs = span.attributes or {}
-        db_system = attrs.get("db.system")
+        # Both OpenTelemetry semantic-convention eras. semconv 1.x renamed
+        # db.system -> db.system.name and db.name -> db.namespace, and current
+        # instrumentation emits only the new spellings. Reading just the old
+        # name made this processor return early on every database span, so
+        # db.query.count/duration/error_count were never emitted at all and the
+        # dashboard's Database page stayed blank with no error to explain it.
+        # Confirmed live in owl24-js on 2026-09-19; same bug, same fix here.
+        db_system = attrs.get("db.system.name") or attrs.get("db.system")
         if not db_system:
             return
 
         self._ensure_instruments()
+        # Reported under the old key so the dashboard's grouping keeps working
+        # regardless of which convention the span arrived in.
         attributes = {"db.system": db_system}
-        db_name = attrs.get("db.name")
+        db_name = attrs.get("db.namespace") or attrs.get("db.name")
         if db_name:
             attributes["db.name"] = db_name
 
@@ -458,6 +467,24 @@ class MaskingAndOtelHandler(logging.Handler):
         try:
             msg = record.getMessage()
             body = safe_serialize(msg) if isinstance(msg, (dict, list)) else str(msg)
+
+            # Append the traceback when the caller supplied one - via
+            # logging.exception(), or logger.error(..., exc_info=True), or any
+            # handler inside an `except` block.
+            #
+            # record.getMessage() returns ONLY the formatted message, so
+            # `app.logger.error("Flask error: %s", err)` inside an error
+            # handler reached the dashboard as one line with the traceback
+            # discarded in-process. That also starved AI root-cause analysis of
+            # the stack trace it leans on hardest. Same bug and same fix as the
+            # console bridge in owl24-js, found 2026-09-19 by running the demo
+            # servers against a local collector.
+            if record.exc_info:
+                try:
+                    body = f"{body}\n{''.join(traceback.format_exception(*record.exc_info))}"
+                except Exception:
+                    pass  # never let log formatting break the caller's request
+
             masked_body = mask_sensitive_data(body)
             
             current_span = trace.get_current_span()

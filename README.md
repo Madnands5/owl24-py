@@ -1,6 +1,6 @@
 # owl24-py
 
-Python SDK for [owl24](https://owl24.dev) — one line of code to send logs, traces, and metrics to your owl24 dashboard, built on OpenTelemetry.
+Python SDK for [owl24](https://owl24.dev) — one line of code to send logs, traces, and metrics to your owl24 dashboard, built on OpenTelemetry. Errors are deduplicated and can be handed straight to your own coding agent, which claims them, writes a fix, and opens a PR.
 
 ## Install
 
