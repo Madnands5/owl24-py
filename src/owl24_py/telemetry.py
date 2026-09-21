@@ -14,6 +14,28 @@ from importlib.metadata import version as _pkg_version, PackageNotFoundError
 from typing import Any
 from types import MappingProxyType
 
+# Import-order footgun detection (launch backlog item 7, 2026-09-20): this
+# snapshot MUST be the first thing this module does, before any of its own
+# imports below run. Here's why: opentelemetry-instrumentation-fastapi/flask
+# unconditionally `import fastapi`/`import flask` inside their own __init__.py
+# (see the real FastAPI bug this file already works around further down), so
+# this module's OWN _AUTO_INSTRUMENTORS setup below always pulls those
+# frameworks into sys.modules as a side effect - verified live: a fresh
+# process that does nothing but `from owl24_py import Owl24` already has
+# fastapi/flask in sys.modules by the time that import finishes, regardless
+# of anything the customer's own code did. A naive "is fastapi in
+# sys.modules" check at Owl24.init() time would therefore fire on every
+# single init() call, which is worse than not warning at all - it trains
+# customers to ignore the warning, so the real occurrences get missed too.
+#
+# The fix: capture what was ALREADY in sys.modules before this module's own
+# imports have a chance to add anything. If fastapi/flask show up in THIS
+# snapshot, something in the customer's own import chain (their entry point,
+# or a transitive import like an auth helper) loaded it before ever reaching
+# `from owl24_py import Owl24` - the actual condition the docs warn about.
+# If it only appears later, it was us, and Owl24.init() should stay silent.
+_MODULES_PRESENT_BEFORE_OWL24_IMPORT = frozenset(sys.modules.keys())
+
 # This module's own print statements use emoji (see below) - on Windows,
 # the console's default codepage (cp1252) can't encode them, which throws
 # a UnicodeEncodeError right on the *success* print at the end of init()'s
@@ -115,6 +137,62 @@ try:
     _AUTO_INSTRUMENTORS.append(("sqlalchemy", SQLAlchemyInstrumentor))
 except ImportError:
     pass
+
+# Import-order footgun (launch backlog item 7, 2026-09-20): the fastapi/
+# flask instrumentors above patch the framework's own App/Flask class
+# __init__. If your app object gets constructed before Owl24.init() runs,
+# that construction used the unpatched class - instrumentation is silently
+# inactive for the whole process, and nothing about it looks broken: the app
+# runs fine, requests work, there is just no tracing.
+#
+# Scoped to fastapi/flask only, not django or the DB drivers/`requests`
+# above: those instrumentors patch free functions rather than a singleton
+# app object a customer constructs once, so a late init() still catches
+# every future call - this footgun is specific to frameworks with a
+# constructed instance whose __init__ needs to already be patched.
+#
+# This checks _MODULES_PRESENT_BEFORE_OWL24_IMPORT (captured at the very top
+# of this file), NOT plain `name in sys.modules` - see that snapshot's own
+# comment for why a plain presence check is actively wrong here: this file's
+# own _AUTO_INSTRUMENTORS setup above already imports fastapi/flask as a
+# side effect regardless of customer behavior, so a bare presence check
+# would fire on every single init() call. Whether the name was ALREADY
+# present before this module's own imports ran is what actually
+# distinguishes "the customer's own import chain got there first" from
+# "we just did that ourselves a few lines up."
+#
+# Deliberately NOT trying to name the culprit module that pulled the import
+# in - the snapshot only proves something outside this module imported it
+# first, not which of possibly many earlier imports (stdlib, third-party,
+# the app's own code) was responsible. Guessing wrong would be worse than
+# saying nothing; the fix (move Owl24.init() earlier) is the same regardless
+# of which import caused it.
+_ORDER_SENSITIVE_FRAMEWORKS = ("fastapi", "flask")
+
+
+def _warn_if_framework_already_imported():
+    already_imported = [
+        name for name in _ORDER_SENSITIVE_FRAMEWORKS
+        if name in _MODULES_PRESENT_BEFORE_OWL24_IMPORT
+    ]
+    if not already_imported:
+        return
+    names = " and ".join(already_imported)
+    print(
+        "[Owl24] " + "=" * 68 + "\n"
+        f"[Owl24] WARNING: {names} already imported before Owl24.init() ran.\n"
+        f"[Owl24] Auto-instrumentation for {names} is INACTIVE for this process -\n"
+        "[Owl24] requests will not be traced, and nothing else will look broken.\n"
+        "[Owl24]\n"
+        "[Owl24] This is almost always a TRANSITIVE import: some other module\n"
+        f"[Owl24] your entry point imports first (e.g. an auth helper) itself\n"
+        f"[Owl24] imports {names} - that counts the same as importing it directly.\n"
+        "[Owl24]\n"
+        "[Owl24] FIX: call Owl24.init(...) as the very first lines of your\n"
+        "[Owl24] entry point, before any other import in the file.\n"
+        "[Owl24] " + "=" * 68,
+        file=sys.stderr,
+    )
 
 # Maps Python's stdlib level names to the OTLP SeverityNumber enum - the log
 # bridge previously stored logging._levelToName's raw string here (wrong
@@ -635,6 +713,12 @@ class Owl24:
             this SDK at their own collector instead of owl24's hosted
             endpoint.
         """
+        # Checked before anything else in init() - this is a warning about
+        # init() itself having run too late, so it needs to fire regardless
+        # of whether the rest of init() even succeeds (missing API key,
+        # exporter construction failure, etc. below).
+        _warn_if_framework_already_imported()
+
         configure_masking(mask_fields, internal_hostname_suffixes)
         resolved_api_key = api_key or os.getenv("owl24_API_KEY") or os.getenv("OBSERVE_API_KEY")
         user_email = os.getenv("owl24_USER_EMAIL") or os.getenv("OBSERVE_USER_EMAIL") or "unknown@local.dev"

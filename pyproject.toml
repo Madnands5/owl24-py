@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "owl24-py"
-version = "0.1.9"
+version = "0.1.10"
 description = "Python SDK for owl24 - one line of code to send logs, traces, and metrics to your owl24 dashboard, built on OpenTelemetry, with errors queued straight to your own coding agent to fix and PR."
 readme = "README.md"
 requires-python = ">=3.8"
